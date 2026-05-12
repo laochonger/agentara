@@ -5,7 +5,7 @@ import { z } from "zod";
  */
 export const AgentConfig = z.object({
   type: z.string(),
-  model: z.string().default("claude-sonnet-4-6"),
+  model: z.string().default("claude-opus-4-7"),
 });
 export interface AgentConfig extends z.infer<typeof AgentConfig> {}
 

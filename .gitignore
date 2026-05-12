@@ -47,3 +47,8 @@ __pycache__
 *.pywz
 *.pyzw
 *.pyz
+
+# local-only skills and workspaces
+user-home/.claude/skills/follow-builders/
+user-home/.claude/skills/xhs-search/
+xhs-search-workspace/
