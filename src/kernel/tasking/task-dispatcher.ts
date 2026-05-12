@@ -635,7 +635,13 @@ export class TaskDispatcher {
     const { payload } = job.data;
     const sessionId = job.data.session_id ?? uuid();
 
-    const previous = this._sessionLocks.get(sessionId) ?? Promise.resolve();
+    // Swallow a previous task's rejection on the lock chain so that one
+    // failed task does not poison every subsequent task on the same session:
+    // a rejected `previous` would otherwise propagate straight through
+    // `previous.then(...)` and the handler would never run.
+    const previous = (this._sessionLocks.get(sessionId) ?? Promise.resolve()).catch(
+      () => {},
+    );
 
     const current = previous.then(async () => {
       const handler = this._handlers.get(payload.type);
