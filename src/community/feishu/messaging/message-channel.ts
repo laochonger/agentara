@@ -22,6 +22,34 @@ import { renderMessageCard, splitMarkdownByTables } from "./message-renderer";
 import type { MessageReceiveEventData } from "./types";
 import { convertPostToMarkdown } from "./utils";
 
+/**
+ * Retry an idempotent Feishu call on transient gateway errors (502/503/504).
+ *
+ * IMPORTANT: only safe to wrap idempotent operations such as `im.message.patch`.
+ * Wrapping `im.message.reply` / `im.message.create` can produce duplicate user-
+ * visible messages, because 5xx gateway errors often mean "request was accepted
+ * upstream but the response was lost" — the message may already be delivered
+ * even though we got an error.
+ */
+async function _withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const status = (err as { response?: { status?: number } })?.response
+        ?.status;
+      if (status === 502 || status === 503 || status === 504) {
+        lastErr = err;
+        await new Promise((r) => setTimeout(r, 500 * 2 ** i));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 function _isFeishuBadRequestError(err: unknown): boolean {
   if (!err || typeof err !== "object") {
     return false;
@@ -57,6 +85,9 @@ export class FeishuMessageChannel
   private _client: Client;
   private _db: DrizzleDB;
   private _failedCardUpdateMessages = new Set<string>();
+  /** Tracks message IDs for which the post-failure fallback reply has already
+   *  been sent, so an upstream double-call does not deliver duplicate replies. */
+  private _sentFinalFallback = new Set<string>();
   private _logger: Logger;
 
   /**
@@ -226,6 +257,14 @@ export class FeishuMessageChannel
     { streaming = true }: { streaming?: boolean } = {},
   ): Promise<void> {
     if (this._failedCardUpdateMessages.has(message.id)) {
+      // Card is permanently sealed (a prior patch hit 400). On the final
+      // non-streaming call, deliver the actual answer as a fresh reply so
+      // the user isn't left with only the "更新失败" apology. Guard with a
+      // separate set so an upstream double-call doesn't post duplicate replies.
+      if (!streaming && !this._sentFinalFallback.has(message.id)) {
+        this._sentFinalFallback.add(message.id);
+        await this._replyFinalContentAfterCardFailure(message);
+      }
       return;
     }
 
@@ -242,14 +281,16 @@ export class FeishuMessageChannel
       this._logOutboundMessage(message.session_id, message.content);
     }
     try {
-      await this._client.im.message.patch({
-        path: {
-          message_id: message.id,
-        },
-        data: {
-          content: JSON.stringify(card),
-        },
-      });
+      await _withRetry(() =>
+        this._client.im.message.patch({
+          path: {
+            message_id: message.id,
+          },
+          data: {
+            content: JSON.stringify(card),
+          },
+        }),
+      );
     } catch (err) {
       if (_isFeishuBadRequestError(err)) {
         this._failedCardUpdateMessages.add(message.id);
@@ -510,6 +551,53 @@ export class FeishuMessageChannel
           `Failed to send file attachment: ${filePath}`,
         );
       }
+    }
+  }
+
+  /**
+   * Deliver the actual final answer after the streaming card has been sealed
+   * by a 400 error. Renders a lean card containing only the text content
+   * (skipping thinking and tool_use entries that bloated the original card)
+   * and sends it as a new reply.
+   */
+  private async _replyFinalContentAfterCardFailure(
+    message: AssistantMessage,
+  ): Promise<void> {
+    const finalTextOnly = message.content.filter(
+      (c) => c.type === "text",
+    ) as AssistantMessage["content"];
+    if (finalTextOnly.length === 0) {
+      return;
+    }
+    const { firstMessageContent, remainingChunks } = this._prepareMessageContent(
+      finalTextOnly,
+      false,
+    );
+    const card = await renderMessageCard(firstMessageContent, {
+      streaming: false,
+      uploadImage: this.uploadImage.bind(this),
+    });
+    this._logOutboundMessage(message.session_id, message.content);
+    try {
+      // No retry: reply is non-idempotent and a 5xx may have already delivered.
+      await this._client.im.message.reply({
+        path: { message_id: message.id },
+        data: {
+          msg_type: "interactive",
+          content: JSON.stringify(card),
+          reply_in_thread: true,
+        },
+      });
+      await this._sendRemainingChunks(message.id, remainingChunks);
+      const lastText = finalTextOnly.findLast((c) => c.type === "text");
+      if (lastText?.type === "text") {
+        await this._sendLocalFileAttachments(message.id, lastText.text);
+      }
+    } catch (err) {
+      this._logger.warn(
+        { err, message_id: message.id, session_id: message.session_id },
+        "Failed to deliver final content after card update failure",
+      );
     }
   }
 

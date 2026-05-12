@@ -340,8 +340,21 @@ function _renderTool(
   }
 }
 
+/**
+ * Max characters kept per step label. Long thinking blocks and verbose
+ * Bash commands are the main contributors to card payload bloat; truncating
+ * each step's display text keeps any one element from blowing past
+ * the per-element size limits even when the element count is under cap.
+ */
+const MAX_STEP_TEXT_CHARS = 200;
+
 /** Create a step element (icon + text) for the collapsible panel. */
 function _renderStep(text: string, iconToken: string): DivElement {
+  const flat = text.replace(/\s+/g, " ").trim();
+  const truncated =
+    flat.length > MAX_STEP_TEXT_CHARS
+      ? flat.slice(0, MAX_STEP_TEXT_CHARS - 1) + "…"
+      : flat;
   return {
     tag: "div",
     icon: {
@@ -353,7 +366,7 @@ function _renderStep(text: string, iconToken: string): DivElement {
       tag: "plain_text",
       text_color: "grey",
       text_size: "notation",
-      content: text,
+      content: truncated,
     },
   };
 }
